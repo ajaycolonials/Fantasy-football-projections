@@ -1,0 +1,283 @@
+import time
+import requests
+import mysql.connector
+from mysql.connector import Error
+
+# ----------------------------
+# DB config
+# ----------------------------
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "Box60Boat",
+    "database": "fantasy_app",
+}
+
+# ----------------------------
+# API config
+# ----------------------------
+BASE_URL = "https://api.statrankings.com/stats-service/nfl/players/general"
+
+COMMON_PARAMS = {
+    "split": "ALL_GAMES",
+    "rate": "SEASON",
+    "sortOrder": "DESC",
+    "seasonType": "REG",
+    "pageSize": 100,
+}
+
+STAT_TYPE = "GAMES_PLAYED"
+ALLOWED_POS = {"QB", "RB", "WR", "TE"}
+
+# If API gives teamName but not abbreviation, we map it:
+TEAM_MAP = {
+    "Arizona Cardinals": "ARI",
+    "Atlanta Falcons": "ATL",
+    "Baltimore Ravens": "BAL",
+    "Buffalo Bills": "BUF",
+    "Carolina Panthers": "CAR",
+    "Chicago Bears": "CHI",
+    "Cincinnati Bengals": "CIN",
+    "Cleveland Browns": "CLE",
+    "Dallas Cowboys": "DAL",
+    "Denver Broncos": "DEN",
+    "Detroit Lions": "DET",
+    "Green Bay Packers": "GB",
+    "Houston Texans": "HOU",
+    "Indianapolis Colts": "IND",
+    "Jacksonville Jaguars": "JAX",
+    "Kansas City Chiefs": "KC",
+    "Las Vegas Raiders": "LV",
+    "Los Angeles Chargers": "LAC",
+    "Los Angeles Rams": "LAR",
+    "Miami Dolphins": "MIA",
+    "Minnesota Vikings": "MIN",
+    "New England Patriots": "NE",
+    "New Orleans Saints": "NO",
+    "New York Giants": "NYG",
+    "New York Jets": "NYJ",
+    "Philadelphia Eagles": "PHI",
+    "Pittsburgh Steelers": "PIT",
+    "San Francisco 49ers": "SF",
+    "Seattle Seahawks": "SEA",
+    "Tampa Bay Buccaneers": "TB",
+    "Tennessee Titans": "TEN",
+    "Washington Commanders": "WAS",
+}
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+
+def get_connection():
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+def get_team_id(cur, team_abbrev: str | None) -> int | None:
+    if not team_abbrev:
+        return None
+    cur.execute("SELECT team_id FROM teams WHERE abbreviation=%s", (team_abbrev,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def normalize_team_abbrev(row: dict) -> str | None:
+    """
+    Try to infer team abbreviation from the API row.
+    Prefer teamAbbreviation if present; otherwise map teamName.
+    """
+    abbrev = row.get("teamAbbreviation") or row.get("teamAbbrev") or row.get("team")
+    if abbrev and isinstance(abbrev, str) and 2 <= len(abbrev.strip()) <= 4:
+        return abbrev.strip()
+
+    team_name = row.get("teamName")
+    if team_name:
+        return TEAM_MAP.get(team_name)
+
+    return None
+
+
+def get_json_with_retries(url: str, params: dict, max_tries: int = 5) -> dict:
+    backoff = 0.75
+    for attempt in range(1, max_tries + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if attempt == max_tries:
+                raise
+            time.sleep(backoff)
+            backoff *= 1.7
+
+
+def fetch_all_rows(season: int) -> list[dict]:
+    """Paginate until API returns empty data list."""
+    all_rows = []
+    page = 1
+
+    while True:
+        params = {
+            **COMMON_PARAMS,
+            "season": season,
+            "statType": STAT_TYPE,
+            "page": page,
+        }
+
+        payload = get_json_with_retries(BASE_URL, params)
+        rows = payload.get("data", [])
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+        page += 1
+
+    return all_rows
+
+
+def upsert_player(cur, full_name: str, position: str, team_id: int | None):
+    """
+    Upsert by (full_name, position).
+    - If exists: update team_id
+    - If not: insert with status='retired' temporarily (final status set later)
+    """
+    cur.execute(
+        "SELECT player_id FROM players WHERE full_name=%s AND position=%s",
+        (full_name, position),
+    )
+    row = cur.fetchone()
+
+    if row:
+        player_id = int(row[0])
+        cur.execute(
+            "UPDATE players SET team_id=%s WHERE player_id=%s",
+            (team_id, player_id),
+        )
+        return player_id, "updated"
+    else:
+        cur.execute(
+            """
+            INSERT INTO players (full_name, position, team_id, status)
+            VALUES (%s, %s, %s, 'retired')
+            """,
+            (full_name, position, team_id),
+        )
+        return cur.lastrowid, "inserted"
+
+
+def set_statuses_from_db(cur):
+    """
+    Correct, DB-driven status assignment:
+
+    active  = has player_season_stats row for 2025 with games_played > 0
+    retired = everyone else
+    """
+    # 1) default everyone to retired
+    cur.execute("UPDATE players SET status='retired'")
+
+    # 2) mark active if they played in 2025 (based on your stored stats, not names)
+    cur.execute(
+        """
+        UPDATE players p
+        JOIN player_season_stats s
+          ON s.player_id = p.player_id
+        SET p.status = 'active'
+        WHERE s.season = 2025
+          AND s.games_played > 0
+        """
+    )
+
+
+def main():
+    seasons = list(range(2021, 2026))  # 2021..2025 inclusive
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    total_inserted = 0
+    total_updated = 0
+    total_skipped_pos = 0
+    total_missing_team = 0
+
+    for season in seasons:
+        print(f"\n[INFO] Fetching {STAT_TYPE} rows for season {season}")
+        rows = fetch_all_rows(season)
+        print(f"[INFO] Got {len(rows)} rows (all positions)")
+
+        season_inserted = 0
+        season_updated = 0
+        season_skipped = 0
+        season_missing_team = 0
+
+        for row in rows:
+            name = row.get("playerName")
+            pos = row.get("position")
+            stat_val = row.get("statValue")
+
+            if not name or not pos or stat_val is None:
+                continue
+
+            if pos not in ALLOWED_POS:
+                season_skipped += 1
+                continue
+
+            # Only include players who actually played > 0 games that season
+            try:
+                games = int(stat_val)
+            except (TypeError, ValueError):
+                continue
+
+            if games <= 0:
+                continue
+
+            team_abbrev = normalize_team_abbrev(row)
+            team_id = get_team_id(cur, team_abbrev)
+
+            if team_abbrev and team_id is None:
+                season_missing_team += 1
+
+            _, action = upsert_player(cur, name, pos, team_id)
+            if action == "inserted":
+                season_inserted += 1
+            else:
+                season_updated += 1
+
+        conn.commit()
+        print(
+            f"[DONE] season={season} inserted={season_inserted} updated={season_updated} "
+            f"skipped_non_fantasy_pos={season_skipped} missing_team_lookup={season_missing_team}"
+        )
+
+        total_inserted += season_inserted
+        total_updated += season_updated
+        total_skipped_pos += season_skipped
+        total_missing_team += season_missing_team
+
+    print("\n[INFO] Setting player statuses from DB (2025 games_played)...")
+    set_statuses_from_db(cur)
+    conn.commit()
+
+    # Optional: print active count after setting statuses
+    cur.execute("SELECT COUNT(*) FROM players WHERE status='active'")
+    active_count = int(cur.fetchone()[0])
+
+    print("\n[SUMMARY]")
+    print(f"Inserted total: {total_inserted}")
+    print(f"Updated total:  {total_updated}")
+    print(f"Skipped non-fantasy positions: {total_skipped_pos}")
+    print(f"Missing team lookups: {total_missing_team}")
+    print(f"Active players (played in 2025 per DB): {active_count}")
+
+    cur.close()
+    conn.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Error as db_err:
+        print(f"[DB ERROR] {db_err}")
+    except requests.RequestException as req_err:
+        print(f"[HTTP ERROR] {req_err}")
+    except Exception as e:
+        print(f"[ERROR] {e}")
