@@ -1,21 +1,3 @@
-# rf_train_and_project_2026_holdout_ppg17.py
-#
-# Holdout-year training:
-#   Train on:   2021->2022, 2022->2023, 2023->2024
-#   Holdout on: 2024->2025
-#
-# Model target:
-#   Predict PPR fantasy points PER GAME (PPG) for next season.
-# Projection:
-#   2026 projected total points = predicted_2026_ppg * 17 (assume healthy 17 games)
-#
-# Main changes in this version:
-# - Removed the most important blanket fillna(0) spots that could drag projections down
-# - Use position-median fallback for ppg_1y instead of 0
-# - Use training-set medians for X_train / X_hold
-# - Use final training medians for 2025 -> 2026 projection inputs
-# - Do not fill y with 0 (build_pairs already filters invalid targets)
-
 import os
 import mysql.connector
 import pandas as pd
@@ -25,9 +7,9 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 
 
-# ----------------------------
+
 # Config
-# ----------------------------
+
 TARGET_PTS = "fantasy_points_ppr"
 GAMES_COL = "games_played"
 
@@ -79,9 +61,9 @@ DB_CONFIG = {
 }
 
 
-# ----------------------------
+
 # DB helpers
-# ----------------------------
+
 def read_sql_df(query: str) -> pd.DataFrame:
     conn = mysql.connector.connect(**DB_CONFIG)
     try:
@@ -91,16 +73,6 @@ def read_sql_df(query: str) -> pd.DataFrame:
 
 
 def upsert_projections_ppr(proj_df: pd.DataFrame):
-    """
-    Inserts/updates 2026 PPR projections into `projections`.
-
-    NOTE:
-    - projections.format enum is assumed to be ('ppr','half_ppr','standard')
-    - ON DUPLICATE KEY UPDATE requires a UNIQUE KEY to actually dedupe.
-      Recommended:
-        ALTER TABLE projections
-        ADD UNIQUE KEY uniq_proj (player_id, season, format, model_name, model_version);
-    """
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
 
@@ -146,12 +118,12 @@ def upsert_projections_ppr(proj_df: pd.DataFrame):
             int(r["player_id"]),
             2026,
             "ppr",
-            None, None, None, None, None, None,   # passing
-            None, None, None,                     # rushing
-            None, None, None, None,               # receiving
+            None, None, None, None, None, None,
+            None, None, None,
+            None, None, None, None,
             float(r["proj_fantasy_points_ppr"]),
             "random_forest",
-            "holdout_ppg17_4"
+            "teamcontext_step1"
         ))
 
     cur.executemany(sql, rows)
@@ -162,27 +134,16 @@ def upsert_projections_ppr(proj_df: pd.DataFrame):
     conn.close()
 
 
-# ----------------------------
 # Pair builder (year_from -> year_to)
-# ----------------------------
-def build_pairs(df: pd.DataFrame, features: list[str], year_from: int, year_to: int) -> pd.DataFrame:
-    """
-    Build paired dataset:
-      X from year_from -> y_ppg from year_to for same player_id.
 
-    y_ppg = fantasy_points_ppr / games_played in year_to
-    We filter out players with very low games in year_to to reduce noise.
-    Also filter out players with very low games in year_from so feature rows are more stable.
-    """
+def build_pairs(df: pd.DataFrame, features: list[str], year_from: int, year_to: int) -> pd.DataFrame:
     a = df[df["season"] == year_from].copy()
     b = df[df["season"] == year_to].copy()
 
-    # Keep feature-year games too
     a = a[["player_id", "position", GAMES_COL] + features].copy()
     a = a.rename(columns={c: f"{c}_x" for c in features})
     a = a.rename(columns={GAMES_COL: "x_games"})
 
-    # y: compute PPG from year_to
     b = b[["player_id", TARGET_PTS, GAMES_COL]].copy()
     b = b.rename(columns={TARGET_PTS: "y_pts", GAMES_COL: "y_games"})
 
@@ -191,7 +152,6 @@ def build_pairs(df: pd.DataFrame, features: list[str], year_from: int, year_to: 
 
     paired["y_ppg"] = paired["y_pts"] / paired["y_games"].replace(0, np.nan)
 
-    # Filter out tiny feature-year and target-year samples
     paired = paired[
         paired["x_games"].notna() & (paired["x_games"] >= MIN_GAMES_FOR_PPG) &
         paired["y_games"].notna() & (paired["y_games"] >= MIN_GAMES_FOR_PPG)
@@ -200,42 +160,90 @@ def build_pairs(df: pd.DataFrame, features: list[str], year_from: int, year_to: 
 
     return paired
 
+
 def main():
-    # ----------------------------
-    # Pull data
-    # ----------------------------
-    season_stats = read_sql_df("""
-        SELECT *
-        FROM player_season_stats
-        WHERE season BETWEEN 2021 AND 2025;
+
+    # Pull player + team-context data
+
+    df = read_sql_df("""
+        SELECT
+            pss.*,
+            p.full_name,
+            p.position,
+            p.status,
+
+            tss.average_scoring_margin,
+            tss.offensive_tds_per_game,
+            tss.points_per_game,
+            tss.points_per_play,
+            tss.plays_per_game,
+            tss.seconds_per_play,
+            tss.neutral_situation_pace,
+            tss.no_huddle_rate,
+            tss.yards_per_play,
+            tss.yards_per_game,
+            tss.first_downs_per_game,
+            tss.first_downs_per_play,
+            tss.third_down_conversion_pct,
+            tss.fourth_down_conversion_pct,
+            tss.pass_attempts_per_game,
+            tss.passing_play_pct,
+            tss.passing_tds_per_game,
+            tss.completions_per_game,
+            tss.yards_per_completion,
+            tss.pass_rate_over_expectation,
+            tss.pass_rate_neutral_script,
+            tss.pass_rate_positive_script,
+            tss.pass_rate_negative_script,
+            tss.pass_rate_red_zone,
+            tss.rushing_attempts_per_game,
+            tss.rushing_first_down_pct,
+            tss.rushing_first_downs_per_game,
+            tss.rushing_play_pct,
+            tss.rushing_tds_per_game,
+            tss.rushing_yards_per_game,
+            tss.rush_yards_per_attempt,
+            tss.rush_rate_neutral_script,
+            tss.rush_rate_positive_script,
+            tss.rush_rate_negative_script,
+            tss.explosive_play_rate,
+            tss.epa_per_play_pass,
+            tss.epa_per_play_rush,
+            tss.inside_zone_rate,
+            tss.inside_zone_ypa,
+            tss.outside_zone_rate,
+            tss.outside_zone_ypa,
+            tss.power_rate,
+            tss.power_ypa,
+            tss.stuff_rate,
+            tss.avoided_tackle_rate,
+            tss.yac_per_attempt,
+            tss.ybc_per_attempt
+
+        FROM player_season_stats pss
+        JOIN players p
+            ON pss.player_id = p.player_id
+        LEFT JOIN team_season_stats tss
+            ON pss.team_id = tss.team_id
+           AND pss.season = tss.season
+        WHERE pss.season BETWEEN 2021 AND 2025
+          AND p.position IN ('QB', 'RB', 'WR', 'TE');
     """)
 
-    players = read_sql_df("""
-        SELECT player_id, full_name, position, status
-        FROM players;
-    """)
-
-    df = season_stats.merge(players, on="player_id", how="left")
-
-    # ----------------------------
     # Required columns check
-    # ----------------------------
     required_cols = [TARGET_PTS, GAMES_COL, "season", "player_id", "position", "age"]
     for col in required_cols:
         if col not in df.columns:
             raise ValueError(f"Required column '{col}' not found in merged dataframe.")
 
-    # ----------------------------
     # Create PPG history features
-    # ----------------------------
+  
     df = df.sort_values(["player_id", "season"]).copy()
 
     df["ppg_1y"] = df[TARGET_PTS] / df[GAMES_COL].replace(0, np.nan)
     df["ppg_2y"] = df.groupby("player_id")["ppg_1y"].shift(1)
     df["ppg_3y"] = df.groupby("player_id")["ppg_1y"].shift(2)
 
-    # Better missing-history handling:
-    # Instead of forcing ppg_1y missing values to 0, use position median.
     pos_ppg_median = df.groupby("position")["ppg_1y"].transform("median")
     overall_ppg_median = df["ppg_1y"].median()
     pos_ppg_median = pos_ppg_median.fillna(overall_ppg_median)
@@ -245,32 +253,21 @@ def main():
     df["ppg_3y"] = df["ppg_3y"].fillna(df["ppg_2y"])
     df["ppg_max_3y"] = df[["ppg_1y", "ppg_2y", "ppg_3y"]].max(axis=1)
     df["ppg_mean_3y"] = df[["ppg_1y", "ppg_2y", "ppg_3y"]].mean(axis=1)
-    
+
     df["high_end_ppg_flag"] = 0
     df.loc[(df["position"] == "QB") & (df["ppg_max_3y"] >= 22), "high_end_ppg_flag"] = 1
     df.loc[(df["position"] == "RB") & (df["ppg_max_3y"] >= 19), "high_end_ppg_flag"] = 1
     df.loc[(df["position"] == "WR") & (df["ppg_max_3y"] >= 18), "high_end_ppg_flag"] = 1
     df.loc[(df["position"] == "TE") & (df["ppg_max_3y"] >= 14), "high_end_ppg_flag"] = 1
-        # Weighted smoothing
+
     df["ppg_weighted_3y"] = (
         0.6 * df["ppg_1y"] +
         0.3 * df["ppg_2y"] +
         0.1 * df["ppg_3y"]
     )
-    # ----------------------------
-    # Usage trend features
-    # ----------------------------
-   
 
-
-    # ----------------------------
-    # DEBUG: Check ppg_1y for specific players
-    # ----------------------------
-    
-
-    # ----------------------------
     # Convert core total stats to per-game features
-    # ----------------------------
+
     PER_GAME_BASE_STATS = [
         "pass_attempts",
         "pass_completions",
@@ -289,25 +286,21 @@ def main():
     for col in PER_GAME_BASE_STATS:
         if col in df.columns:
             df[f"{col}_pg"] = df[col] / df["games_played"].replace(0, np.nan)
-            # Keeping this as 0 for now, since for these counting stats
-            # zero is often a valid football outcome.
             df[f"{col}_pg"] = df[f"{col}_pg"].fillna(0)
-    # ----------------------------
-# Red-zone count stats -> per-game
-# ----------------------------
+
     REDZONE_COUNT_STATS = [
-      "rz_rush_attempts",
+        "rz_rush_attempts",
         "carries_inside_5",
         "red_zone_targets",
         "red_zone_rec_tds",
         "red_zone_rush_tds",
     ]
-    
 
     for col in REDZONE_COUNT_STATS:
         if col in df.columns:
             df[f"{col}_pg"] = df[col] / df["games_played"].replace(0, np.nan)
             df[f"{col}_pg"] = df[f"{col}_pg"].fillna(0)
+
     usage_delta_cols = [
         "pass_attempts_pg",
         "pass_completions_pg",
@@ -331,22 +324,22 @@ def main():
         if col in df.columns:
             prev = df.groupby("player_id")[col].shift(1)
             df[f"{col}_delta_1y"] = (df[col] - prev).fillna(0)
-            
+
     advanced_delta_cols = [
-    "snap_share_pct",
-    "true_target_share_pct",
-    "first_read_target_share_pct",
-    "rb_opportunity_share_pct",
-    "first_read_pct",
-    "deep_throw_rate_pct",
-    "qbr_when_clean",
-    "time_to_throw_sec",
-    "rz_rush_share",
-    "inside5_share",
-    "td_rate_inside_5",
-    "touch_share_pct",
-    "red_zone_target_share",
-    "red_zone_rec_conversion_rate"
+        "snap_share_pct",
+        "true_target_share_pct",
+        "first_read_target_share_pct",
+        "rb_opportunity_share_pct",
+        "first_read_pct",
+        "deep_throw_rate_pct",
+        "qbr_when_clean",
+        "time_to_throw_sec",
+        "rz_rush_share",
+        "inside5_share",
+        "td_rate_inside_5",
+        "touch_share_pct",
+        "red_zone_target_share",
+        "red_zone_rec_conversion_rate"
     ]
 
     for col in advanced_delta_cols:
@@ -354,20 +347,26 @@ def main():
             prev = df.groupby("player_id")[col].shift(1)
             df[f"{col}_delta_1y"] = (df[col] - prev).fillna(0)
 
-    # ----------------------------
+    # Add team-relative opportunity features
+    if "targets_pg" in df.columns and "pass_attempts_per_game" in df.columns:
+        df["target_share_team"] = (
+            df["targets_pg"] / df["pass_attempts_per_game"].replace(0, np.nan)
+        ).fillna(0)
+
+    if "rush_attempts_pg" in df.columns and "rushing_attempts_per_game" in df.columns:
+        df["rush_share_team"] = (
+            df["rush_attempts_pg"] / df["rushing_attempts_per_game"].replace(0, np.nan)
+        ).fillna(0)
+
     # Add nonlinear age feature
-    # ----------------------------
     df["age_sq"] = df["age"] ** 2
 
-    # ----------------------------
     # Auto-detect FEATURES
-    # ----------------------------
-    # Features = all numeric columns except ids/season/target points.
-    # Drop games_played to avoid durability leakage into PPG skill model.
     exclude = {
         "player_id",
         "season",
-        "fantasy_points_ppr",
+        "team_id",
+        "fantasy_points_ppr",   
         "fantasy_points_half",
         "fantasy_points_std",
         "pass_attempts",
@@ -385,11 +384,12 @@ def main():
         "ppg_1y",
         "ppg_2y",
         "ppg_3y",
+        "ppg_max_3y",            
         "ppg_min_3y",
         "ppg_mean_3y",
+        "high_end_ppg_flag",     
         "ppg_recent_ceiling_blend",
-        
-        }
+    }
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     features = [c for c in numeric_cols if c not in exclude]
@@ -399,90 +399,106 @@ def main():
 
     print(f"\n[INFO] Features count = {len(features)}")
     print(features)
-    print("[INFO] age in features:", "age" in features)
-    print("[INFO] age_sq in features:", "age_sq" in features)
+    print("[INFO] fantasy_points_ppr in features:", "fantasy_points_ppr" in features)
+    print("[INFO] ppg_weighted_3y in features:", "ppg_weighted_3y" in features)
+    print("[INFO] ppg_max_3y in features:", "ppg_max_3y" in features)
+    print("[INFO] high_end_ppg_flag in features:", "high_end_ppg_flag" in features)
+    print("[INFO] target_share_team in features:", "target_share_team" in features)
+    print("[INFO] rush_share_team in features:", "rush_share_team" in features)
+
+    # ROLLING VALIDATION SETUP
+    rolling_folds = [
+        ([(2021, 2022), (2022, 2023)], (2023, 2024)),
+        ([(2021, 2022), (2022, 2023), (2023, 2024)], (2024, 2025)),
+    ]
+
+    all_results = []
+    eval_ok = {}
 
     # ----------------------------
-    # HOLDOUT SETUP
+    # Rolling validation per position
     # ----------------------------
-    train_pairs = [(2021, 2022), (2022, 2023), (2023, 2024)]
-    holdout_pair = (2024, 2025)
-
-    train_df = pd.concat(
-        [build_pairs(df, features, a, b) for (a, b) in train_pairs],
-        ignore_index=True
-    )
-
-    holdout_df = build_pairs(df, features, holdout_pair[0], holdout_pair[1])
-
-    print(f"\n[INFO] Train rows (stacked pairs): {len(train_df)}")
-    print(f"[INFO] Holdout rows (2024->2025): {len(holdout_df)}")
-
-    # ----------------------------
-    # Train + holdout-eval per position
-    # ----------------------------
-    holdout_models = {}
-
     for pos in POSITIONS:
-        tr = train_df[train_df["position"] == pos].copy()
-        ho = holdout_df[holdout_df["position"] == pos].copy()
+        print(f"\n================ {pos} ROLLING VALIDATION ================")
 
-        if len(tr) < 60 or len(ho) < 20:
-            print(f"[SKIP] {pos}: not enough data (train={len(tr)}, holdout={len(ho)})")
+        pos_results = []
+
+        for fold_i, (train_pairs, test_pair) in enumerate(rolling_folds):
+            print(f"\n[FOLD {fold_i + 1}] Train={train_pairs} Test={test_pair}")
+
+            train_df = pd.concat(
+                [build_pairs(df, features, a, b) for (a, b) in train_pairs],
+                ignore_index=True
+            )
+
+            test_df = build_pairs(df, features, test_pair[0], test_pair[1])
+
+            tr = train_df[train_df["position"] == pos].copy()
+            te = test_df[test_df["position"] == pos].copy()
+
+            if len(tr) < 50 or len(te) < 15:
+                print(f"[SKIP] not enough data (train={len(tr)}, test={len(te)})")
+                continue
+
+            X_train = tr[[f"{c}_x" for c in features]].copy()
+            X_test = te[[f"{c}_x" for c in features]].copy()
+
+            train_medians = X_train.median()
+            X_train = X_train.fillna(train_medians)
+            X_test = X_test.fillna(train_medians)
+
+            y_train = tr["y_ppg"].copy()
+            y_test = te["y_ppg"].copy()
+
+            model = RandomForestRegressor(
+                n_estimators=1200,
+                random_state=42,
+                max_depth=None,
+                min_samples_leaf=1,
+                n_jobs=-1
+            )
+
+            model.fit(X_train, y_train)
+
+            importances = pd.Series(
+                model.feature_importances_,
+                index=X_train.columns
+            ).sort_values(ascending=False)
+
+            print(f"\n[IMPORTANCE] Top 15 features for {pos}, fold {fold_i + 1}:")
+            print(importances.head(15))
+
+            pred_ppg = model.predict(X_test)
+
+            fold_df = pd.DataFrame({
+                "player_id": te["player_id"].values,
+                "position": pos,
+                "actual_ppg": y_test.values,
+                "pred_ppg": pred_ppg
+            })
+
+            fold_df["error"] = fold_df["pred_ppg"] - fold_df["actual_ppg"]
+            fold_df["fold"] = fold_i + 1
+
+            pos_results.append(fold_df)
+
+        if not pos_results:
+            print(f"[SKIP] {pos}: no valid rolling folds")
             continue
 
-        X_train = tr[[f"{c}_x" for c in features]].copy()
-        X_hold = ho[[f"{c}_x" for c in features]].copy()
+        pos_all = pd.concat(pos_results, ignore_index=True)
 
-        # Use training medians instead of blanket zero-fill
-        train_medians = X_train.median()
-        X_train = X_train.fillna(train_medians)
-        X_hold = X_hold.fillna(train_medians)
+        mae = mean_absolute_error(pos_all["actual_ppg"], pos_all["pred_ppg"])
+        bias = pos_all["error"].mean()
+        median_error = pos_all["error"].median()
+        pred_std = pos_all["pred_ppg"].std()
+        actual_std = pos_all["actual_ppg"].std()
 
-        y_train = tr["y_ppg"].copy()
-        y_hold = ho["y_ppg"].copy()
+        print(f"\n[ROLLING RESULTS] {pos}")
+        print(f"MAE_PPG={mae:.2f}")
+        print(f"BIAS={bias:.2f} median_error={median_error:.2f}")
+        print(f"SPREAD pred_std={pred_std:.2f} actual_std={actual_std:.2f}")
 
-        model = RandomForestRegressor(
-            n_estimators=1200,
-            random_state=42,
-            max_depth = 10,
-            min_samples_leaf=2,
-            
-            n_jobs=-1
-        )
-
-        model.fit(X_train, y_train)
-
-        importances = pd.Series(
-            model.feature_importances_,
-            index=X_train.columns
-        ).sort_values(ascending=False)
-
-        print(f"\n[IMPORTANCE] Top 15 features for {pos}:")
-        print(importances.head(15))
-
-        pred_ppg = model.predict(X_hold)
-        mae_ppg = mean_absolute_error(y_hold, pred_ppg)
-                # ----------------------------
-        # Bias / underprojection diagnostics
-        # ----------------------------
-        holdout_results = ho[["player_id"]].copy()
-        holdout_results["actual_ppg"] = y_hold.values
-        holdout_results["pred_ppg"] = pred_ppg
-        holdout_results["error"] = holdout_results["pred_ppg"] - holdout_results["actual_ppg"]
-
-        # Overall signed bias
-        mean_error = holdout_results["error"].mean()
-        median_error = holdout_results["error"].median()
-
-        # Spread check
-        pred_std = holdout_results["pred_ppg"].std()
-        actual_std = holdout_results["actual_ppg"].std()
-
-        print(f"[BIAS] {pos} mean_error={mean_error:.2f} median_error={median_error:.2f}")
-        print(f"[SPREAD] {pos} pred_std={pred_std:.2f} actual_std={actual_std:.2f}")
-
-        # Top-end bias check: actual top scorers
         if pos == "QB":
             top_n = 12
         elif pos in ["RB", "WR"]:
@@ -490,35 +506,24 @@ def main():
         else:
             top_n = 12
 
-        top_actual = holdout_results.sort_values("actual_ppg", ascending=False).head(top_n).copy()
+        top_actual = pos_all.sort_values("actual_ppg", ascending=False).head(top_n).copy()
         top_actual_bias = top_actual["error"].mean()
 
         print(f"[TOP-END BIAS] {pos} top_{top_n}_actual mean_error={top_actual_bias:.2f}")
 
         print(f"\n[TOP UNDERPROJECTIONS] {pos}")
-        print(
-            holdout_results.sort_values("error")
-            .head(10)
-            .to_string(index=False)
-        )
+        print(pos_all.sort_values("error").head(10).to_string(index=False))
 
         print(f"\n[TOP OVERPROJECTIONS] {pos}")
-        print(
-            holdout_results.sort_values("error", ascending=False)
-            .head(10)
-            .to_string(index=False)
-        )
-        mae_pts_17 = mae_ppg * 17
+        print(pos_all.sort_values("error", ascending=False).head(10).to_string(index=False))
 
-        print(
-            f"[HOLDOUT VAL] {pos}  "
-            f"MAE_PPG={mae_ppg:.2f}  MAE_17G_PTS={mae_pts_17:.2f}  "
-            f"train={len(tr)} holdout={len(ho)}"
-        )
+        mae_pts_17 = mae * 17
+        print(f"[ROLLING VAL] {pos}  MAE_PPG={mae:.2f}  MAE_17G_PTS={mae_pts_17:.2f}")
 
-        holdout_models[pos] = model
+        all_results.append(pos_all)
+        eval_ok[pos] = True
 
-    if not holdout_models:
+    if not eval_ok:
         print("[ERROR] No models trained. Check data coverage.")
         return
 
@@ -550,8 +555,8 @@ def main():
         model = RandomForestRegressor(
             n_estimators=1200,
             random_state=42,
-            min_samples_leaf=2,
-            max_depth = 10,
+            min_samples_leaf=1,
+            max_depth=None,
             n_jobs=-1
         )
 
@@ -566,13 +571,10 @@ def main():
         print("[ERROR] No final models trained. Check data coverage.")
         return
 
-    # ----------------------------
     # Project 2026 from 2025 features
-    # ----------------------------
     df_2025 = df[df["season"] == 2025].copy()
     df_2025 = df_2025[df_2025["position"].isin(POSITIONS)].copy()
 
-    # Keep all RB/WR/TE, but only projected starting QBs
     qb_mask = (df_2025["position"] != "QB") | (df_2025["full_name"].isin(PROJECTED_STARTING_QBS))
     df_2025 = df_2025[qb_mask].copy()
 
@@ -593,7 +595,6 @@ def main():
         X_2025 = part[features].copy()
         X_2025.columns = [f"{c}_x" for c in features]
 
-        # Use medians from that position's final training data
         X_2025 = X_2025.fillna(final_feature_medians[pos])
 
         proj_ppg_2026 = model.predict(X_2025)
@@ -624,5 +625,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
