@@ -1,12 +1,31 @@
+# Python
 __pycache__/
 *.pyc
-.venv/
-venv/
-.env
-.vscode/
-.idea/
-.DS_Store
+*.pyo
+*.pyd
 
-*.csv
-*.xlsx
-*.db
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables (IMPORTANT)
+.env
+
+# OS / misc
+.DS_Store
+Thumbs.db
+
+# Build / temp folders
+.dist/
+*/.dist/
+
+# Outputs (ignore all except your sample file)
+outputs/*
+!outputs/sample_top50_2026.csv
+
+# Jupyter (if you ever use it)
+.ipynb_checkpoints/
+
+# Logs
+*.log
