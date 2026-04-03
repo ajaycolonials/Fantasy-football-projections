@@ -57,12 +57,32 @@ The model predicts fantasy points per game and converts them into full-season pr
 
 ## Example Output
 
-Top projected players include:
+Sample projections are available in:
 
-- Josh Allen
-- Jalen Hurts
-- Puka Nacua
-- Bijan Robinson
+outputs/sample_top50_2026.csv
+
+This file contains the top 50 projected players for the 2026 season based on the model.
+
+## Database Schema
+
+See `sql/schema.sql` for the structure of player, team, and projection data used in the model.
+
+## How to Run
+
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Set up a MySQL database and update connection credentials in the script
+
+3. Run the model:
+   python models/rf_train_and_project_2026.py
+
+## What I Learned
+
+- How to build an end-to-end machine learning pipeline using real-world sports data  
+- How feature selection and data leakage impact model performance  
+- Why time-based validation is critical for forecasting problems  
+- How team context and usage share improve player-level predictions  
 
 ## Future Improvements
 
