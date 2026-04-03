@@ -620,6 +620,12 @@ def main():
                  .head(50)
                  .to_string(index=False)
     )
+    proj_2026_sorted = proj_2026.sort_values("proj_fantasy_points_ppr", ascending=False)
+
+    proj_2026_sorted.head(50).to_csv(
+        "outputs/sample_top50_2026.csv",
+        index=False
+    )
 
     upsert_projections_ppr(proj_2026)
 
